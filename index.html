@@ -23,19 +23,22 @@ const {useState,useEffect,useCallback,useMemo,useRef}=React;
 const IS_LOCAL=["localhost","127.0.0.1"].includes(location.hostname);
 const GI_BASE="https://gameinfo.albiononline.com/api/gameinfo/items";
 const AODP="https://www.albion-online-data.com/api/v2/stats/prices";
+const AODP_HIST="https://www.albion-online-data.com/api/v2/stats/history";
 const ICON="https://render.albiononline.com/v1/item";
 function giUrl(id){const raw=`${GI_BASE}/${id}/data`;return IS_LOCAL?`proxy.php?url=${encodeURIComponent(raw)}`:`https://corsproxy.io/?url=${encodeURIComponent(raw)}`;}
 
 const CITIES=["Caerleon","Bridgewatch","Lymhurst","Martlock","Thetford","Fort Sterling","Brecilien"];
 const RRR={Caerleon:[15,44],Bridgewatch:[25,48],Lymhurst:[25,48],Martlock:[25,48],Thetford:[25,48],"Fort Sterling":[25,48],Brecilien:[25,48]};
 const TC={3:"#94a3b8",4:"#4ade80",5:"#60a5fa",6:"#c084fc",7:"#fb923c",8:"#f87171"};
-const EC={1:{color:'#22c55e',label:'■ +1'},2:{color:'#3b82f6',label:'■ +2'},3:{color:'#a855f7',label:'■ +3'}};
+const EC={1:{color:'#22c55e',label:'■ +1'},2:{color:'#3b82f6',label:'■ +2'},3:{color:'#a855f7',label:'■ +3'},4:{color:'#f59e0b',label:'■ +4'}};
+const QUALITIES={1:'Normal',2:'Bonne',3:'Exceptionnelle',4:'Excellente',5:"Chef-d'œuvre"};
 // Recettes de raffinage codées en dur (formule Albion Online stable)
 const RAW_MAP={METALBAR:'ORE',PLANKS:'WOOD',CLOTH:'FIBER',LEATHER:'HIDE',STONEBLOCK:'ROCK'};
 // [nb bruts, nb raffinés tier-1]
 const REF_RATIO={2:[2,0],3:[2,1],4:[2,1],5:[3,2],6:[4,3],7:[5,4],8:[5,4]};
 function getRefineRecipe(itemId){
-  const m=itemId.match(/^T(\d+)_([A-Z]+)(_LEVEL(\d+))?$/);
+  const cleanId=itemId.replace(/@\d+$/,""); // strip @N éventuel
+  const m=cleanId.match(/^T(\d+)_([A-Z]+)(_LEVEL(\d+))?$/);
   if(!m)return null;
   const tier=parseInt(m[1]),base=m[2],ench=m[4]?parseInt(m[4]):0;
   const raw=RAW_MAP[base];if(!raw||!REF_RATIO[tier])return null;
@@ -83,7 +86,10 @@ const fmt=n=>{if(n==null||n===0)return"—";const a=Math.abs(n);if(a>=1e6)return
 const fmtPct=n=>n==null?"—":`${n>=0?"+":""}${n.toFixed(1)}%`;
 const pkey=(id,city)=>`${id}::${city}`;
 const RN={METALBAR:"Barre Métal",PLANKS:"Planches",LEATHER:"Cuir",CLOTH:"Tissu",STONEBLOCK:"Bloc Pierre",ROCK:"Pierre",MEAT:"Viande",CROP:"Récolte",FISH:"Poisson",BREAD:"Pain",EGG:"Œuf",MILK:"Lait",FLOUR:"Farine",HERBS:"Herbes",BUTTER:"Beurre",CHEESE:"Fromage"};
-const rn=id=>{if(!id)return id;const[t,...r]=id.split("_");return`${t} ${RN[r.join("_")]||r.join(" ")}`};
+const rn=id=>{if(!id)return id;const[t,...r]=id.split("_");return`${t} ${RN[r.join("_")]||r.join(" ")}`;};
+// Convertit T4_LEATHER_LEVEL1 → T4_LEATHER@1 pour les lookups AODP
+// Ressources raffinées : T4_LEATHER_LEVEL1 → T4_LEATHER_LEVEL1@1 (format AODP)
+const toAodp=id=>id?id.replace(/_LEVEL(\d+)$/,(_,n)=>`_LEVEL${n}@${n}`):id;
 const pc=v=>v==null?"#6b7280":v>0?"#34d399":"#f87171";
 
 function calcCity(itemId,rec,prices,c,focus,tax,fee){
@@ -116,6 +122,8 @@ function App(){
   const[pStatus,setPStatus]=useState("idle");
   const[pError,setPError]=useState("");
   const[updated,setUpdated]=useState(null);
+  const[quality,setQuality]=useState(1);
+  const[history,setHistory]=useState({});
   const[enchs,setEnchs]=useState([0]);
   const[sortCol,setSortCol]=useState("profit");
   const[sortDir,setSortDir]=useState("desc");
@@ -143,60 +151,151 @@ function App(){
     })));
   },[typeObj,sub,cat,tiers,enchs]);
 
-  const fetchRecipe=useCallback(async(itemId)=>{
-    if(pendingR.current.has(itemId))return;
-    pendingR.current.add(itemId);
-    setRecipes(p=>({...p,[itemId]:"loading"}));
+  const fetchHistory=useCallback(async(itemId)=>{
+    const hkey=`${itemId}::hist`;
+    if(history[hkey]!==undefined)return;
+    setHistory(p=>({...p,[hkey]:'loading'}));
     try{
-      const res=await fetch(giUrl(itemId),{signal:AbortSignal.timeout(12000)});
+      const loc=CITIES.map(c=>encodeURIComponent(c)).join(',');
+      const res=await fetch(`${AODP_HIST}/${itemId}.json?locations=${loc}&qualities=${quality}&time-scale=24`,{signal:AbortSignal.timeout(10000)});
+      if(!res.ok)throw new Error(res.status);
+      const data=await res.json();
+      // data = [{item_id, city, data:[{item_count,avg_price,timestamp}]}]
+      const byCity={};
+      if(Array.isArray(data))data.forEach(d=>{if((d.location||d.city)&&d.data?.length)byCity[d.location||d.city]=d.data;});
+      setHistory(p=>({...p,[hkey]:byCity}));
+    }catch(e){setHistory(p=>({...p,[hkey]:{}}))}
+  },[history,quality]);
+
+  const fetchRecipe=useCallback(async(itemId)=>{
+    // Toujours fetcher depuis l'ID de base (strip @N)
+    const baseId=itemId.replace(/@\d+$/,"");
+    // Si la base est déjà en cours ou faite, pas besoin de refetcher
+    if(pendingR.current.has(baseId))return;
+    pendingR.current.add(baseId);
+    // Marquer loading pour base + tous les enchantements possibles
+    setRecipes(p=>{
+      const u={};
+      [baseId,baseId+"@1",baseId+"@2",baseId+"@3"].forEach(id=>{if(!(id in p))u[id]="loading";});
+      return{...p,...u};
+    });
+    try{
+      const res=await fetch(giUrl(baseId),{signal:AbortSignal.timeout(12000)});
       if(!res.ok)throw new Error("HTTP "+res.status);
       const data=await res.json();
+      console.log("[Recipe]",baseId,"keys:",Object.keys(data));
       const frName=data?.localizedNames?.["FR-FR"]||data?.localizedNames?.["EN-US"];
-      if(frName)setGiNames(p=>({...p,[itemId]:frName}));
-      const list=data?.craftingRequirements?.craftResourceList;
-      setRecipes(p=>({...p,[itemId]:list?.length?list.map(r=>({id:r.uniqueName,qty:r.count})):null}));
-    }catch(e){setRecipes(p=>({...p,[itemId]:null}));}
-    finally{pendingR.current.delete(itemId);}
+      const updates={};
+      if(frName){
+        setGiNames(p=>{
+          const u={[baseId]:frName};
+          [1,2,3].forEach(e=>{u[baseId+"@"+e]=frName;});
+          return{...p,...u};
+        });
+      }
+      // Helper : extraire craftResourceList depuis un objet ou tableau de requirements
+      const extractList=req=>{
+        if(!req)return null;
+        // req peut être un objet direct ou un tableau (multiple crafting options)
+        const obj=Array.isArray(req)?req[0]:req;
+        const list=obj?.craftResourceList??obj?.craftresourcelist??obj?.CraftResourceList;
+        if(!list?.length)return null;
+        return list.map(r=>({
+          id:r.uniqueName??r.UniqueName??r.uniquename,
+          qty:r.count??r.Count??r.amount??1
+        })).filter(r=>r.id);
+      };
+      // Recette de base (@0) — peut être dans craftingRequirements ou enchantments[{level:0}]
+      const baseReq=data?.craftingRequirements??data?.CraftingRequirements;
+      let baseList=extractList(baseReq);
+      // Fallback : chercher level 0 dans enchantments si base vide
+      const rawEnch=data?.enchantments??data?.Enchantments;
+      const enchArr=Array.isArray(rawEnch)?rawEnch:(Array.isArray(rawEnch?.enchantments)?rawEnch.enchantments:[]);
+      if(!baseList){
+        const enc0=enchArr.find(e=>(e.enchantmentLevel??e.EnchantmentLevel)===0);
+        baseList=extractList(enc0?.craftingRequirements??enc0?.CraftingRequirements);
+      }
+      updates[baseId]=baseList;
+      console.log("[Recipe]",baseId,"@0 =>",baseList?.length,"ingr, enchants:",enchArr.length);
+      // Recettes enchantées @1 @2 @3
+      enchArr.forEach(enc=>{
+        const lvl=enc.enchantmentLevel??enc.EnchantmentLevel;
+        if(!lvl)return;
+        const list=extractList(enc.craftingRequirements??enc.CraftingRequirements);
+        updates[baseId+"@"+lvl]=list;
+      });
+      [1,2,3].forEach(e=>{if(!(baseId+"@"+e in updates))updates[baseId+"@"+e]=null;});
+      setRecipes(p=>({...p,...updates}));
+    }catch(e){
+      setRecipes(p=>{
+        const u={[baseId]:null};
+        [1,2,3].forEach(e=>{u[baseId+"@"+e]=null;});
+        return{...p,...u};
+      });
+    }finally{pendingR.current.delete(baseId);}
   },[]);
 
   const fetchPrices=useCallback(async(ids)=>{
     if(!ids?.length)return;
     setPStatus("loading");setPError("");
     const loc=CITIES.map(c=>c.replace(/ /g,"%20")).join(",");
-    const chunks=[];for(let i=0;i<ids.length;i+=30)chunks.push(ids.slice(i,i+30));
-    const newP={};let anyOk=false,lastErr="";
-    for(const chunk of chunks){
-      try{
-        const res=await fetch(`${AODP}/${chunk.join(",")}.json?locations=${loc}&qualities=1`,{signal:AbortSignal.timeout(12000)});
-        if(!res.ok)throw new Error("HTTP "+res.status);
-        const data=await res.json();
-        if(Array.isArray(data)){for(const d of data){if(!d.item_id||!d.city)continue;newP[pkey(d.item_id,d.city)]={sell:d.sell_price_min||0,buy:d.buy_price_max||0};if(d.sell_price_min>0||d.buy_price_max>0)anyOk=true;}}
-      }catch(e){lastErr=e.message;}
+    const fetchBatch=async(batchIds,q)=>{
+      const chunks=[];for(let i=0;i<batchIds.length;i+=100)chunks.push(batchIds.slice(i,i+100));
+      const out={};
+      for(let ci=0;ci<chunks.length;ci++){
+        if(ci>0)await new Promise(r=>setTimeout(r,350));
+        try{
+          const res=await fetch(`${AODP}/${chunks[ci].join(",")}.json?locations=${loc}&qualities=${q}`,{signal:AbortSignal.timeout(12000)});
+          if(!res.ok)throw new Error("HTTP "+res.status);
+          const data=await res.json();
+          if(Array.isArray(data))data.forEach(d=>{if(d.item_id&&d.city)out[pkey(d.item_id,d.city)]={sell:d.sell_price_min||0,buy:d.buy_price_max||0};});
+        }catch(e){}
+      }
+      return out;
+    };
+    // Pass 1 : tous les IDs à la qualité sélectionnée (prix de vente)
+    const newP=await fetchBatch(ids,quality);
+    // Pass 2 : ingrédients toujours à quality=1 (ressources n'ont que quality=1 sur le marché)
+    if(quality!==1){
+      const ingIds=[...new Set(Object.values(recipes).filter(Array.isArray).flatMap(r=>r.map(ri=>toAodp(ri.id))))].filter(id=>ids.includes(id));
+      if(ingIds.length){const ingP=await fetchBatch(ingIds,1);Object.assign(newP,ingP);}
     }
     setPrices(p=>({...p,...newP}));
-    if(Object.keys(newP).length>0){setPStatus("ok");setUpdated(new Date());}
-    else{setPStatus("error");setPError(lastErr||"Aucune donnée.");}
-  },[]);
+    const anyOk=Object.values(newP).some(v=>v.sell>0||v.buy>0);
+    if(anyOk){setPStatus("ok");setUpdated(new Date());}
+    else{setPStatus("error");setPError("Aucune donnée.");}
+  },[quality,recipes]);
 
   const allPriceIds=useMemo(()=>{
     const ids=new Set(itemList.map(i=>i.id));
-    Object.values(recipes).forEach(r=>{if(Array.isArray(r))r.forEach(ri=>ids.add(ri.id));});
+    Object.values(recipes).forEach(r=>{if(Array.isArray(r))r.forEach(ri=>ids.add(toAodp(ri.id)));});
     return[...ids];
   },[itemList,recipes]);
 
   useEffect(()=>{
-    if(cat?.isResource)return; // recettes codées en dur pour les ressources
-    const missing=itemList.filter(i=>!i.noRecipe&&!(i.id in recipes)&&!pendingR.current.has(i.id));
+    if(cat?.isResource)return;
+    // Dédupliquer par baseId pour éviter de fetcher la même recette plusieurs fois
+    const seenBase=new Set();
+    const missing=itemList.filter(i=>{
+      if(i.noRecipe)return false;
+      const base=i.id.replace(/@\d+$/,"");
+      if(seenBase.has(base)||pendingR.current.has(base))return false;
+      if(i.id in recipes&&recipes[i.id]!=="loading")return false;
+      seenBase.add(base);return true;
+    });
     if(!missing.length)return;
     const run=async()=>{for(let i=0;i<missing.length;i+=3)await Promise.allSettled(missing.slice(i,i+3).map(item=>fetchRecipe(item.id)));};
     run();
-  },[catId,subId,typeId,tiers]);// eslint-disable-line
+  },[catId,subId,typeId,tiers,enchs]);// eslint-disable-line
 
   const prevIds=useRef("[]");
+
+  useEffect(()=>{prevIds.current="[]";setPrices({});setHistory({});},[quality]);
+  useEffect(()=>{if(expanded)fetchHistory(expanded);},[expanded,city,quality]);
   useEffect(()=>{
     const cur=JSON.stringify([...allPriceIds].sort());
     if(cur!==prevIds.current){prevIds.current=cur;fetchPrices(allPriceIds);}
-  },[allPriceIds]);// eslint-disable-line
+  },[allPriceIds,quality]);// eslint-disable-line
 
   const calcItem=useCallback((item)=>{
     // Ressources : recette codée en dur (raffinées) ou pas de recette (brutes)
@@ -206,7 +305,7 @@ function App(){
     const{sp,mc,profit,margin}=calcCity(item.id,recData,prices,city,focus,tax,fee);
     const rec=recData;
     const rrr=(RRR[city]?.[focus?1:0]??0)/100;
-    const detail=rec?rec.map(ri=>{const mp=prices[pkey(ri.id,city)]?.sell||0;const eff=ri.qty*(1-rrr);return{...ri,mp,eff,cost:mp*eff};}):[];
+    const detail=rec?rec.map(ri=>{const mp=prices[pkey(toAodp(ri.id),city)]?.sell||0;const eff=ri.qty*(1-rrr);return{...ri,mp,eff,cost:mp*eff};}):[];
     const isLoading=cat?.isResource?false:(recipes[item.id]==="loading");
     return{sellP:sp,matCost:mc,profit,margin,rec,detail,isLoading};
   },[prices,recipes,city,focus,tax,fee]);
@@ -228,11 +327,58 @@ function App(){
   };
   const itemName=(id,fallback)=>giNames[id]||fallback;
 
-  const Spin=({s=11})=><div style={{width:s,height:s,border:"2px solid #2a3040",borderTop:"2px solid #c9a227",borderRadius:"50%",animation:"spin 1s linear infinite",display:"inline-block",flexShrink:0}}/>;
-  const Arr=({col})=><span style={{marginLeft:2,color:sortCol===col?"#c9a227":"#374151",fontSize:8}}>{sortCol===col?(sortDir==="desc"?"▼":"▲"):"⇅"}</span>;
+  // Sparkline mini-graphe prix historique
+  const Sparkline=({itemId})=>{
+    const hkey=`${itemId}::hist`;
+    const hdata=history[hkey];
+    if(hdata==='loading')return<div style={{display:'flex',alignItems:'center',gap:6,color:'#4b5563',fontSize:14,height:70}}><Spin/>Chargement historique…</div>;
+    if(!hdata||typeof hdata!=='object')return<div style={{color:'#374151',fontSize:15,height:70,display:'flex',alignItems:'center'}}>Pas de données historiques</div>;
+    const cityData=hdata[city];
+    if(!cityData?.length)return<div style={{color:'#374151',fontSize:15,height:70,display:'flex',alignItems:'center'}}>Pas de données pour {city}</div>;
+    const pts=cityData.filter(d=>d.avg_price>0).slice(-60);
+    if(pts.length<2)return<div style={{color:'#374151',fontSize:15,height:70,display:'flex',alignItems:'center'}}>Données insuffisantes</div>;
+    const prices=pts.map(d=>d.avg_price);
+    const mn=Math.min(...prices),mx=Math.max(...prices);
+    const W=460,H=110,PX=4,PY=12;
+    const px=(i)=>PX+(i/(pts.length-1))*(W-2*PX);
+    const py=(v)=>PY+H-PY*2-((v-mn)/(mx-mn||1))*(H-PY*2);
+    const polyPts=pts.map((d,i)=>`${px(i).toFixed(1)},${py(d.avg_price).toFixed(1)}`).join(' ');
+    const last=prices[prices.length-1],first=prices[0];
+    const trend=last>=first?'#34d399':'#f87171';
+    const fmtDate=ts=>{if(!ts)return'';const d=new Date(ts);return d.toLocaleDateString('fr-FR',{day:'2-digit',month:'short'}).replace('.','');};
+    const lastDate=fmtDate(pts[pts.length-1]?.timestamp);
+    const firstDate=fmtDate(pts[0]?.timestamp);
+    const area=pts.map((d,i)=>`${px(i).toFixed(1)},${py(d.avg_price).toFixed(1)}`).join(' ')
+      +` ${px(pts.length-1).toFixed(1)},${H} ${PX},${H}`;
+    return(
+      <div>
+        <svg width={W} height={H} style={{display:'block',overflow:'visible'}}>
+          <defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={trend} stopOpacity="0.18"/>
+            <stop offset="100%" stopColor={trend} stopOpacity="0.02"/>
+          </linearGradient></defs>
+          <polygon points={area} fill="url(#sg)"/>
+          <polyline points={polyPts} fill="none" stroke={trend} strokeWidth={1.5} strokeLinejoin="round"/>
+          <circle cx={px(pts.length-1)} cy={py(last)} r={3} fill={trend}/>
+          <text x={PX} y={H-1} fill="#374151" fontSize={7}>{firstDate}</text>
+          <text x={W-PX} y={H-1} fill="#374151" fontSize={7} textAnchor="end">{lastDate}</text>
+          <text x={W-PX} y={py(mx)-3} fill="#6b7280" fontSize={8} textAnchor="end">{fmt(mx)} ☽</text>
+          <text x={W-PX} y={py(mn)+10} fill="#6b7280" fontSize={8} textAnchor="end">{fmt(mn)} ☽</text>
+        </svg>
+        <div style={{fontSize:15,color:'#4b5563',marginTop:2,display:'flex',gap:12}}>
+          <span>Dernier : <span style={{color:trend,fontWeight:600}}>{fmt(last)} ☽</span></span>
+          <span style={{color:last>=first?'#34d399':'#f87171'}}>{last>=first?'▲':'▼'} {Math.abs(((last-first)/first)*100).toFixed(1)}% sur la période</span>
+          <span style={{color:'#374151'}}>{pts.length} points · {QUALITIES[quality]}</span>
+        </div>
+      </div>
+    );
+  };
+
+  const Spin=({s=13})=><div style={{width:s,height:s,border:"2px solid #2a3040",borderTop:"2px solid #c9a227",borderRadius:"50%",animation:"spin 1s linear infinite",display:"inline-block",flexShrink:0}}/>;
+  const Arr=({col})=><span style={{marginLeft:2,color:sortCol===col?"#c9a227":"#374151",fontSize:14}}>{sortCol===col?(sortDir==="desc"?"▼":"▲"):"⇅"}</span>;
 
   return(
-    <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#070a0f",color:"#d1d5db",fontFamily:"'IBM Plex Mono','Consolas',monospace",fontSize:13,overflow:"hidden"}}>
+    <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#070a0f",color:"#d1d5db",fontFamily:"'IBM Plex Mono','Consolas',monospace",fontSize:15,overflow:"hidden"}}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
         @keyframes spin{to{transform:rotate(360deg)}}
@@ -246,57 +392,63 @@ function App(){
         .cty:hover{background:#0f1520!important;cursor:pointer}
       `}</style>
 
-      <header style={{display:"flex",alignItems:"center",gap:12,padding:"0 14px",height:50,background:"#0b0f17",borderBottom:"1px solid #1e2533",flexShrink:0}}>
+      <header style={{display:"flex",alignItems:"center",gap:12,padding:"0 18px",height:62,background:"#0b0f17",borderBottom:"1px solid #1e2533",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
-          <span style={{fontSize:18}}>⚒️</span>
+          <span style={{fontSize:22}}>⚒️</span>
           <div>
-            <div style={{fontFamily:"'Cinzel',serif",fontSize:12,fontWeight:700,color:"#c9a227",letterSpacing:1}}>ALBION CRAFT</div>
-            <div style={{fontSize:6,color:IS_LOCAL?"#34d399":"#f59e0b",letterSpacing:2}}>{IS_LOCAL?"● PROXY LOCAL":"● CORSPROXY.IO"}</div>
+            <div style={{fontFamily:"'Cinzel',serif",fontSize:14,fontWeight:700,color:"#c9a227",letterSpacing:1}}>ALBION CRAFT</div>
+            <div style={{fontSize:14,color:IS_LOCAL?"#34d399":"#f59e0b",letterSpacing:2}}>{IS_LOCAL?"● PROXY LOCAL":"● CORSPROXY.IO"}</div>
           </div>
         </div>
         <div style={{width:1,height:22,background:"#1e2533"}}/>
         <label style={{display:"flex",flexDirection:"column",gap:1}}>
-          <span style={{fontSize:6,color:"#4b5563",letterSpacing:1}}>VILLE</span>
-          <select value={city} onChange={e=>setCity(e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"3px 7px",fontSize:11,fontFamily:"inherit"}}>
+          <span style={{fontSize:14,color:"#4b5563",letterSpacing:1}}>VILLE</span>
+          <select value={city} onChange={e=>setCity(e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"5px 10px",fontSize:15,fontFamily:"inherit"}}>
             {CITIES.map(c=><option key={c}>{c}</option>)}
           </select>
         </label>
         <label style={{display:"flex",flexDirection:"column",gap:1}}>
-          <span style={{fontSize:6,color:"#4b5563",letterSpacing:1}}>TAXE %</span>
-          <input type="number" value={tax} min={0} max={20} step={0.5} onChange={e=>setTax(+e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"3px 6px",fontSize:11,width:50,fontFamily:"inherit"}}/>
+          <span style={{fontSize:14,color:"#4b5563",letterSpacing:1}}>QUALITÉ</span>
+          <select value={quality} onChange={e=>setQuality(+e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"5px 10px",fontSize:15,fontFamily:"inherit"}}>
+            {Object.entries(QUALITIES).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+          </select>
         </label>
         <label style={{display:"flex",flexDirection:"column",gap:1}}>
-          <span style={{fontSize:6,color:"#4b5563",letterSpacing:1}}>FRAIS %</span>
-          <input type="number" value={fee} min={0} max={10} step={0.5} onChange={e=>setFee(+e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"3px 6px",fontSize:11,width:50,fontFamily:"inherit"}}/>
+          <span style={{fontSize:14,color:"#4b5563",letterSpacing:1}}>TAXE %</span>
+          <input type="number" value={tax} min={0} max={20} step={0.5} onChange={e=>setTax(+e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"5px 8px",fontSize:15,width:50,fontFamily:"inherit"}}/>
         </label>
-        <label onClick={()=>setFocus(f=>!f)} style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",userSelect:"none",padding:"4px 9px",background:focus?"#1a1500":"#111827",border:`1px solid ${focus?"#c9a227":"#1e2533"}`,borderRadius:4,transition:"all .2s"}}>
+        <label style={{display:"flex",flexDirection:"column",gap:1}}>
+          <span style={{fontSize:14,color:"#4b5563",letterSpacing:1}}>FRAIS %</span>
+          <input type="number" value={fee} min={0} max={10} step={0.5} onChange={e=>setFee(+e.target.value)} style={{background:"#111827",color:"#d1d5db",border:"1px solid #1e2533",borderRadius:4,padding:"5px 8px",fontSize:15,width:50,fontFamily:"inherit"}}/>
+        </label>
+        <label onClick={()=>setFocus(f=>!f)} style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",userSelect:"none",padding:"6px 12px",background:focus?"#1a1500":"#111827",border:`1px solid ${focus?"#c9a227":"#1e2533"}`,borderRadius:4,transition:"all .2s"}}>
           <div style={{width:24,height:13,background:focus?"#c9a227":"#1e2533",borderRadius:7,position:"relative",flexShrink:0}}>
             <div style={{position:"absolute",top:2,left:focus?10:2,width:9,height:9,background:"#fff",borderRadius:"50%",transition:"left .2s"}}/>
           </div>
           <div>
-            <div style={{fontSize:10,fontWeight:600,color:focus?"#c9a227":"#6b7280"}}>Focus</div>
-            <div style={{fontSize:7,color:"#4b5563"}}>RRR: {RRR[city]?.[focus?1:0]}%</div>
+            <div style={{fontSize:14,fontWeight:600,color:focus?"#c9a227":"#6b7280"}}>Focus</div>
+            <div style={{fontSize:15,color:"#4b5563"}}>RRR: {RRR[city]?.[focus?1:0]}%</div>
           </div>
         </label>
         <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
-          {pStatus==="loading"&&<span style={{fontSize:9,color:"#60a5fa",display:"flex",alignItems:"center",gap:4}}><Spin/>Prix…</span>}
-          {updated&&pStatus==="ok"&&<span style={{fontSize:8,color:"#374151"}}>↻ {updated.toLocaleTimeString("fr-FR")}</span>}
-          <button className="btn" onClick={()=>{prevIds.current="[]";fetchPrices(allPriceIds);}} style={{padding:"4px 10px",background:"#111827",border:"1px solid #1e2533",borderRadius:4,color:"#9ca3af",fontSize:10,fontFamily:"inherit",cursor:"pointer",transition:"all .15s"}}>🔄 Actualiser</button>
+          {pStatus==="loading"&&<span style={{fontSize:15,color:"#60a5fa",display:"flex",alignItems:"center",gap:4}}><Spin/>Prix…</span>}
+          {updated&&pStatus==="ok"&&<span style={{fontSize:14,color:"#374151"}}>↻ {updated.toLocaleTimeString("fr-FR")}</span>}
+          <button className="btn" onClick={()=>{prevIds.current="[]";fetchPrices(allPriceIds);}} style={{padding:"6px 13px",background:"#111827",border:"1px solid #1e2533",borderRadius:4,color:"#9ca3af",fontSize:14,fontFamily:"inherit",cursor:"pointer",transition:"all .15s"}}>🔄 Actualiser</button>
         </div>
       </header>
 
-      {pStatus==="error"&&<div style={{padding:"4px 14px",background:"#1f0a0a",borderBottom:"1px solid #7f1d1d",fontSize:10,color:"#fca5a5",display:"flex",gap:10,alignItems:"center",flexShrink:0}}><span>⚠ {pError}</span></div>}
+      {pStatus==="error"&&<div style={{padding:"4px 14px",background:"#1f0a0a",borderBottom:"1px solid #7f1d1d",fontSize:14,color:"#fca5a5",display:"flex",gap:10,alignItems:"center",flexShrink:0}}><span>⚠ {pError}</span></div>}
 
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
-        <aside style={{width:148,background:"#0b0f17",borderRight:"1px solid #1e2533",display:"flex",flexDirection:"column",flexShrink:0,paddingTop:6}}>
+        <aside style={{width:175,background:"#0b0f17",borderRight:"1px solid #1e2533",display:"flex",flexDirection:"column",flexShrink:0,paddingTop:6}}>
           {CATS.map(c=>(
-            <button key={c.id} className="cb" onClick={()=>goCat(c.id)} style={{display:"flex",alignItems:"center",gap:7,padding:"7px 11px",border:"none",background:catId===c.id?"#0f1520":"transparent",color:catId===c.id?"#c9a227":"#6b7280",textAlign:"left",width:"100%",fontSize:11,fontFamily:"inherit",fontWeight:catId===c.id?600:400,borderLeft:catId===c.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s",cursor:"pointer"}}>
-              <span style={{fontSize:13}}>{c.icon}</span><span>{c.label}</span>
+            <button key={c.id} className="cb" onClick={()=>goCat(c.id)} style={{display:"flex",alignItems:"center",gap:7,padding:"9px 14px",border:"none",background:catId===c.id?"#0f1520":"transparent",color:catId===c.id?"#c9a227":"#6b7280",textAlign:"left",width:"100%",fontSize:15,fontFamily:"inherit",fontWeight:catId===c.id?600:400,borderLeft:catId===c.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s",cursor:"pointer"}}>
+              <span style={{fontSize:15}}>{c.icon}</span><span>{c.label}</span>
             </button>
           ))}
-          <div style={{marginTop:"auto",padding:"8px 11px",borderTop:"1px solid #1e2533"}}>
-            <div style={{fontSize:7,color:"#374151",letterSpacing:2,marginBottom:5}}>TIERS</div>
-            {Object.entries(TC).map(([t,c])=>(<div key={t} style={{display:"flex",alignItems:"center",gap:4,marginBottom:3}}><div style={{width:6,height:6,borderRadius:2,background:c}}/><span style={{fontSize:9,color:"#4b5563"}}>T{t}</span></div>))}
+          <div style={{marginTop:"auto",padding:"10px 14px",borderTop:"1px solid #1e2533"}}>
+            <div style={{fontSize:15,color:"#374151",letterSpacing:2,marginBottom:5}}>TIERS</div>
+            {Object.entries(TC).map(([t,c])=>(<div key={t} style={{display:"flex",alignItems:"center",gap:4,marginBottom:3}}><div style={{width:6,height:6,borderRadius:2,background:c}}/><span style={{fontSize:15,color:"#4b5563"}}>T{t}</span></div>))}
           </div>
         </aside>
 
@@ -304,37 +456,37 @@ function App(){
           {/* Niveau 1: sous-catégories (guerrier/chasseur/mage ou tissu/cuir/plate) */}
           <div style={{display:"flex",background:"#0b0f17",borderBottom:"1px solid #1e2533",flexShrink:0}}>
             {cat?.subs.map(s=>(
-              <button key={s.id} className="sb" onClick={()=>goSub(s.id)} style={{padding:"7px 12px",border:"none",background:"transparent",color:subId===s.id?"#c9a227":"#4b5563",fontSize:11,fontFamily:"inherit",fontWeight:subId===s.id?600:400,cursor:"pointer",borderBottom:subId===s.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s"}}>{s.label}</button>
+              <button key={s.id} className="sb" onClick={()=>goSub(s.id)} style={{padding:"9px 16px",border:"none",background:"transparent",color:subId===s.id?"#c9a227":"#4b5563",fontSize:15,fontFamily:"inherit",fontWeight:subId===s.id?600:400,cursor:"pointer",borderBottom:subId===s.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s"}}>{s.label}</button>
             ))}
           </div>
           {/* Niveau 2: type d'arme (uniquement pour weapons) */}
           {sub?.types&&(
             <div style={{display:"flex",background:"#0a0e15",borderBottom:"1px solid #1e2533",flexShrink:0,flexWrap:"wrap",padding:"0 4px"}}>
               {sub.types.map(t=>(
-                <button key={t.id} className="tb" onClick={()=>{setTypeId(t.id);setExpanded(null);}} style={{padding:"5px 11px",border:"none",background:"transparent",color:typeId===t.id?"#c9a227":"#374151",fontSize:10,fontFamily:"inherit",fontWeight:typeId===t.id?600:400,cursor:"pointer",borderBottom:typeId===t.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s"}}>{t.label}</button>
+                <button key={t.id} className="tb" onClick={()=>{setTypeId(t.id);setExpanded(null);}} style={{padding:"7px 14px",border:"none",background:"transparent",color:typeId===t.id?"#c9a227":"#374151",fontSize:14,fontFamily:"inherit",fontWeight:typeId===t.id?600:400,cursor:"pointer",borderBottom:typeId===t.id?"2px solid #c9a227":"2px solid transparent",transition:"all .15s"}}>{t.label}</button>
               ))}
             </div>
           )}
           {/* Filtres tiers */}
-          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 13px",background:"#070a0f",borderBottom:"1px solid #1e2533",flexShrink:0,flexWrap:"wrap"}}>
-            <span style={{fontSize:7,color:"#374151",letterSpacing:1}}>TIERS :</span>
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 16px",background:"#070a0f",borderBottom:"1px solid #1e2533",flexShrink:0,flexWrap:"wrap"}}>
+            <span style={{fontSize:15,color:"#374151",letterSpacing:1}}>TIERS :</span>
             {(cat?.tiers||[4,5,6,7,8]).map(t=>(
               <label key={t} style={{display:"flex",alignItems:"center",gap:3,cursor:"pointer"}}>
                 <input type="checkbox" checked={tiers.includes(t)} onChange={()=>setTiers(p=>p.includes(t)?p.filter(x=>x!==t):[...p,t].sort())} style={{accentColor:TC[t],width:11,height:11}}/>
-                <span style={{fontSize:10,fontWeight:600,color:tiers.includes(t)?TC[t]:"#374151",padding:"1px 5px",background:tiers.includes(t)?TC[t]+"18":"transparent",border:`1px solid ${tiers.includes(t)?TC[t]+"44":"#1e2533"}`,borderRadius:3,transition:"all .15s"}}>T{t}</span>
+                <span style={{fontSize:14,fontWeight:600,color:tiers.includes(t)?TC[t]:"#374151",padding:"1px 5px",background:tiers.includes(t)?TC[t]+"18":"transparent",border:`1px solid ${tiers.includes(t)?TC[t]+"44":"#1e2533"}`,borderRadius:3,transition:"all .15s"}}>T{t}</span>
               </label>
             ))}
             <div style={{width:1,height:14,background:"#1e2533",margin:"0 4px"}}/>
-            <span style={{fontSize:7,color:"#374151",letterSpacing:1}}>ENCH :</span>
+            <span style={{fontSize:15,color:"#374151",letterSpacing:1}}>ENCH :</span>
             {sub?.items?.[0]?.noEnch
-              ? <span style={{fontSize:9,color:"#374151",fontStyle:"italic"}}>Pas d'enchantement (Pierre)</span>
-              : [0,1,2,3].map(e=>(
+              ? <span style={{fontSize:15,color:"#374151",fontStyle:"italic"}}>Pas d'enchantement (Pierre)</span>
+              : [0,1,2,3,4].map(e=>(
               <label key={e} style={{display:"flex",alignItems:"center",gap:3,cursor:"pointer"}}>
                 <input type="checkbox" checked={enchs.includes(e)} onChange={()=>setEnchs(p=>p.includes(e)?p.filter(x=>x!==e):[...p,e].sort())} style={{accentColor:e===0?"#6b7280":EC[e].color,width:11,height:11}}/>
-                <span style={{fontSize:10,fontWeight:600,color:enchs.includes(e)?(e===0?"#9ca3af":EC[e].color):"#374151",padding:"1px 5px",background:enchs.includes(e)?(e===0?"#9ca3af18":EC[e].color+"18"):"transparent",border:`1px solid ${enchs.includes(e)?(e===0?"#9ca3af44":EC[e].color+"44"):"#1e2533"}`,borderRadius:3,transition:"all .15s"}}>{e===0?"Base":"+"+e}</span>
+                <span style={{fontSize:14,fontWeight:600,color:enchs.includes(e)?(e===0?"#9ca3af":EC[e].color):"#374151",padding:"1px 5px",background:enchs.includes(e)?(e===0?"#9ca3af18":EC[e].color+"18"):"transparent",border:`1px solid ${enchs.includes(e)?(e===0?"#9ca3af44":EC[e].color+"44"):"#1e2533"}`,borderRadius:3,transition:"all .15s"}}>{e===0?"Base":"+"+e}</span>
               </label>
             ))}
-            <span style={{marginLeft:"auto",fontSize:7,color:"#374151"}}>{sorted.length} articles</span>
+            <span style={{marginLeft:"auto",fontSize:15,color:"#374151"}}>{sorted.length} articles</span>
           </div>
 
           <div style={{flex:1,overflow:"auto"}}>
@@ -342,7 +494,7 @@ function App(){
               <thead style={{position:"sticky",top:0,zIndex:10}}>
                 <tr>
                   {[{c:null,w:40,l:""},{c:"label",l:"ARTICLE"},{c:"tier",w:76,l:"TIER/ENCH"},{c:"sellP",w:106,l:`VENTE (${city.slice(0,5)})`},{c:"matCost",w:106,l:"COÛT MATS"},{c:"profit",w:114,l:"PROFIT"},{c:"margin",w:82,l:"MARGE"},{c:null,w:56,l:""}].map(({c,w,l},i)=>(
-                    <th key={i} onClick={c?()=>doSort(c):undefined} style={{padding:"7px 9px",background:"#0d1117",width:w,borderBottom:"1px solid #1e2533",textAlign:"left",color:sortCol===c?"#c9a227":"#374151",fontSize:7,letterSpacing:1.2,fontWeight:600,cursor:c?"pointer":"default",userSelect:"none",whiteSpace:"nowrap"}}>
+                    <th key={i} onClick={c?()=>doSort(c):undefined} style={{padding:"7px 9px",background:"#0d1117",width:w,borderBottom:"1px solid #1e2533",textAlign:"left",color:sortCol===c?"#c9a227":"#374151",fontSize:15,letterSpacing:1.2,fontWeight:600,cursor:c?"pointer":"default",userSelect:"none",whiteSpace:"nowrap"}}>
                       {l}{c&&<Arr col={c}/>}
                     </th>
                   ))}
@@ -352,62 +504,66 @@ function App(){
                 {sorted.map((row,idx)=>(
                   <React.Fragment key={row.id}>
                     <tr className="rh" onClick={()=>setExpanded(expanded===row.id?null:row.id)} style={{background:idx%2===0?"#070a0f":"#090d14"}}>
-                      <td style={{padding:"4px 4px 4px 9px"}}><div style={{width:28,height:28,borderRadius:3,background:"#111827",border:"1px solid #1e2533",overflow:"hidden"}}><img src={`${ICON}/${row.id}.png?size=28&quality=1`} style={{width:28,height:28}} alt="" onError={e=>e.target.style.display="none"}/></div></td>
-                      <td style={{padding:"4px 9px"}}><span style={{color:"#d1d5db",fontWeight:500}}>{itemName(row.id,row.label)}</span></td>
-                      <td style={{padding:"4px 9px"}}>
-                        <span style={{fontSize:9,fontWeight:700,color:TC[row.tier],padding:"2px 6px",background:TC[row.tier]+"18",border:`1px solid ${TC[row.tier]}33`,borderRadius:3}}>T{row.tier}</span>
-                        {row.ench>0&&<span style={{fontSize:9,fontWeight:700,color:EC[row.ench].color,padding:"2px 5px",background:EC[row.ench].color+"18",border:`1px solid ${EC[row.ench].color}44`,borderRadius:3,marginLeft:3}}>+{row.ench}</span>}
+                      <td style={{padding:"5px 5px 5px 12px"}}><div style={{width:34,height:34,borderRadius:3,background:"#111827",border:"1px solid #1e2533",overflow:"hidden"}}><img src={`${ICON}/${row.id}.png?size=34&quality=1`} style={{width:34,height:34}} alt="" onError={e=>e.target.style.display="none"}/></div></td>
+                      <td style={{padding:"6px 12px"}}><span style={{color:"#d1d5db",fontWeight:500}}>{itemName(row.id,row.label)}</span></td>
+                      <td style={{padding:"6px 12px"}}>
+                        <span style={{fontSize:15,fontWeight:700,color:TC[row.tier],padding:"3px 8px",background:TC[row.tier]+"18",border:`1px solid ${TC[row.tier]}33`,borderRadius:3}}>T{row.tier}</span>
+                        {row.ench>0&&<span style={{fontSize:15,fontWeight:700,color:EC[row.ench].color,padding:"3px 7px",background:EC[row.ench].color+"18",border:`1px solid ${EC[row.ench].color}44`,borderRadius:3,marginLeft:3}}>+{row.ench}</span>}
                       </td>
-                      <td style={{padding:"4px 9px"}}>{pStatus==="loading"?<Spin/>:row.sellP?<span style={{color:"#d1d5db"}}>{fmt(row.sellP)}<span style={{color:"#374151",fontSize:9}}> ☽</span></span>:<span style={{color:"#374151"}}>—</span>}</td>
-                      <td style={{padding:"4px 9px"}}>{row.isLoading?<span style={{fontSize:9,color:"#4b5563",display:"flex",alignItems:"center",gap:3}}><Spin s={9}/>…</span>:row.matCost?<span style={{color:"#9ca3af"}}>{fmt(row.matCost)}<span style={{color:"#374151",fontSize:9}}> ☽</span></span>:<span style={{color:"#374151"}}>—</span>}</td>
-                      <td style={{padding:"4px 9px"}}><span style={{fontWeight:700,color:pc(row.profit)}}>{row.profit!=null?`${row.profit>=0?"+":""}${fmt(row.profit)} ☽`:"—"}</span></td>
-                      <td style={{padding:"4px 9px"}}>{row.margin!=null?<span style={{fontWeight:600,fontSize:11,color:pc(row.margin)}}>{fmtPct(row.margin)}</span>:<span style={{color:"#374151"}}>—</span>}</td>
-                      <td style={{padding:"4px 9px",textAlign:"center"}}>{Array.isArray(row.rec)&&<span style={{fontSize:11,color:expanded===row.id?"#c9a227":"#4b5563"}}>{expanded===row.id?"▲":"▼"}</span>}{row.isLoading&&<Spin s={9}/>}</td>
+                      <td style={{padding:"6px 12px"}}>{pStatus==="loading"?<Spin/>:row.sellP?<span style={{color:"#d1d5db"}}>{fmt(row.sellP)}<span style={{color:"#374151",fontSize:15}}> ☽</span></span>:<span style={{color:"#374151"}}>—</span>}</td>
+                      <td style={{padding:"6px 12px"}}>{row.isLoading?<span style={{fontSize:15,color:"#4b5563",display:"flex",alignItems:"center",gap:3}}><Spin s={9}/>…</span>:row.matCost?<span style={{color:"#9ca3af"}}>{fmt(row.matCost)}<span style={{color:"#374151",fontSize:15}}> ☽</span></span>:<span style={{color:"#374151"}}>—</span>}</td>
+                      <td style={{padding:"6px 12px"}}><span style={{fontWeight:700,color:pc(row.profit)}}>{row.profit!=null?`${row.profit>=0?"+":""}${fmt(row.profit)} ☽`:"—"}</span></td>
+                      <td style={{padding:"6px 12px"}}>{row.margin!=null?<span style={{fontWeight:600,fontSize:15,color:pc(row.margin)}}>{fmtPct(row.margin)}</span>:<span style={{color:"#374151"}}>—</span>}</td>
+                      <td style={{padding:"6px 12px",textAlign:"center"}}>{Array.isArray(row.rec)&&<span style={{fontSize:15,color:expanded===row.id?"#c9a227":"#4b5563"}}>{expanded===row.id?"▲":"▼"}</span>}{row.isLoading&&<Spin s={9}/>}</td>
                     </tr>
                     {expanded===row.id&&(
                       <tr key={row.id+"_x"}>
                         <td colSpan={8} style={{padding:0,background:"#080c12",borderTop:"1px solid #1e2533",borderBottom:"1px solid #1e2533"}}>
                           <div style={{padding:"12px 46px 14px",animation:"fadeIn .15s ease"}}>
-                            {row.isLoading&&<div style={{display:"flex",alignItems:"center",gap:8,color:"#4b5563",fontSize:11,marginBottom:10}}><Spin/>Chargement recette…</div>}
-                            {!row.isLoading&&!Array.isArray(row.rec)&&<div style={{fontSize:10,color:"#6b7280",marginBottom:10,padding:"6px 10px",background:"#111827",borderRadius:4}}>
+                            {row.isLoading&&<div style={{display:"flex",alignItems:"center",gap:8,color:"#4b5563",fontSize:15,marginBottom:10}}><Spin/>Chargement recette…</div>}
+                            {!row.isLoading&&!Array.isArray(row.rec)&&<div style={{fontSize:14,color:"#6b7280",marginBottom:10,padding:"6px 10px",background:"#111827",borderRadius:4}}>
                               {row.noRecipe?"🌿 Ressource brute — prix marché uniquement":("⚠ Recette indisponible"+(IS_LOCAL?" — vérifiez proxy.php":""))}
                             </div>}
                             <div style={{display:"flex",gap:18,flexWrap:"wrap",alignItems:"flex-start",marginBottom:Array.isArray(row.rec)?12:0}}>
                               {Array.isArray(row.rec)&&<div style={{flex:1,minWidth:250}}>
-                                <div style={{fontSize:7,color:"#374151",letterSpacing:2,marginBottom:7}}>INGRÉDIENTS{focus?` · Focus ${RRR[city]?.[1]}% RRR`:""}</div>
+                                <div style={{fontSize:15,color:"#374151",letterSpacing:2,marginBottom:7}}>INGRÉDIENTS{focus?` · Focus ${RRR[city]?.[1]}% RRR`:""}</div>
                                 {row.detail.map((ri,i)=>(
-                                  <div key={i} style={{display:"flex",alignItems:"center",gap:7,padding:"5px 0",borderBottom:"1px solid #111827",fontSize:11}}>
+                                  <div key={i} style={{display:"flex",alignItems:"center",gap:7,padding:"5px 0",borderBottom:"1px solid #111827",fontSize:15}}>
                                     <div style={{width:20,height:20,background:"#111827",border:"1px solid #1e2533",borderRadius:3,flexShrink:0,overflow:"hidden"}}><img src={`${ICON}/${ri.id}.png?size=20&quality=1`} style={{width:20,height:20}} alt="" onError={e=>e.target.style.display="none"}/></div>
-                                    <div style={{flex:1}}><span style={{color:"#c9a227",fontWeight:700}}>{ri.qty}×</span> <span style={{color:"#d1d5db"}}>{rn(ri.id)}</span>{focus&&ri.qty!==ri.eff&&<span style={{fontSize:8,color:"#4b5563",marginLeft:4}}>(eff: {ri.eff.toFixed(1)})</span>}</div>
-                                    <div style={{textAlign:"right",minWidth:120}}>{ri.mp>0?<><div style={{color:"#6b7280",fontSize:9}}>{fmt(ri.mp)} ☽/u</div><div style={{color:"#c9a227",fontWeight:600}}>{fmt(ri.cost)} ☽</div></>:<span style={{color:"#374151",fontSize:9}}>—</span>}</div>
+                                    <div style={{flex:1}}><span style={{color:"#c9a227",fontWeight:700}}>{ri.qty}×</span> <span style={{color:"#d1d5db"}}>{rn(ri.id)}</span>{focus&&ri.qty!==ri.eff&&<span style={{fontSize:14,color:"#4b5563",marginLeft:4}}>(eff: {ri.eff.toFixed(1)})</span>}</div>
+                                    <div style={{textAlign:"right",minWidth:120}}>{ri.mp>0?<><div style={{color:"#6b7280",fontSize:15}}>{fmt(ri.mp)} ☽/u</div><div style={{color:"#c9a227",fontWeight:600}}>{fmt(ri.cost)} ☽</div></>:<span style={{color:"#374151",fontSize:15}}>—</span>}</div>
                                   </div>
                                 ))}
                               </div>}
                               {Array.isArray(row.rec)&&<div style={{minWidth:185,background:"#111827",border:"1px solid #1e2533",borderRadius:5,padding:"11px 13px"}}>
-                                <div style={{fontSize:7,color:"#374151",letterSpacing:2,marginBottom:8}}>{city.toUpperCase()} — RÉSUMÉ</div>
+                                <div style={{fontSize:15,color:"#374151",letterSpacing:2,marginBottom:8}}>{city.toUpperCase()} — RÉSUMÉ</div>
                                 {[{l:"Coût mats",v:fmt(row.matCost),col:"#9ca3af"},{l:`Taxe (${tax}%)`,v:row.sellP?`− ${fmt(row.sellP*tax/100)}`:null,col:"#6b7280"},{l:`Frais (${fee}%)`,v:row.sellP?`− ${fmt(row.sellP*fee/100)}`:null,col:"#6b7280"},{l:"Prix vente",v:fmt(row.sellP),col:"#d1d5db"}].map(({l,v,col},i)=>(
-                                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e2533",fontSize:10}}><span style={{color:"#4b5563"}}>{l}</span><span style={{color:col}}>{v||"—"}</span></div>
+                                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #1e2533",fontSize:14}}><span style={{color:"#4b5563"}}>{l}</span><span style={{color:col}}>{v||"—"}</span></div>
                                 ))}
-                                <div style={{display:"flex",justifyContent:"space-between",padding:"7px 0 0",fontSize:12,fontWeight:700}}><span style={{color:"#9ca3af"}}>Profit</span><span style={{color:pc(row.profit)}}>{row.profit!=null?`${row.profit>=0?"+":""}${fmt(row.profit)} ☽`:"—"}</span></div>
-                                {row.margin!=null&&<div style={{display:"flex",justifyContent:"space-between",fontSize:10,paddingTop:2}}><span style={{color:"#4b5563"}}>Marge</span><span style={{color:pc(row.margin),fontWeight:600}}>{fmtPct(row.margin)}</span></div>}
+                                <div style={{display:"flex",justifyContent:"space-between",padding:"7px 0 0",fontSize:14,fontWeight:700}}><span style={{color:"#9ca3af"}}>Profit</span><span style={{color:pc(row.profit)}}>{row.profit!=null?`${row.profit>=0?"+":""}${fmt(row.profit)} ☽`:"—"}</span></div>
+                                {row.margin!=null&&<div style={{display:"flex",justifyContent:"space-between",fontSize:14,paddingTop:2}}><span style={{color:"#4b5563"}}>Marge</span><span style={{color:pc(row.margin),fontWeight:600}}>{fmtPct(row.margin)}</span></div>}
                               </div>}
                             </div>
                             <div>
-                              <div style={{fontSize:7,color:"#374151",letterSpacing:2,marginBottom:6}}>COMPARATIF PAR VILLE</div>
-                              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-                                <thead><tr>{(Array.isArray(row.rec)?["VILLE","VENTE","COÛT","PROFIT","MARGE","RRR"]:["VILLE","VENTE","RRR"]).map((h,i)=><th key={i} style={{padding:"4px 9px",background:"#0d1117",textAlign:i===0?"left":"right",fontSize:7,letterSpacing:1,color:"#374151",fontWeight:600,borderBottom:"1px solid #1e2533"}}>{h}</th>)}</tr></thead>
+                              <div style={{fontSize:15,color:"#374151",letterSpacing:2,marginBottom:6}}>COMPARATIF PAR VILLE</div>
+                              <table style={{width:"100%",borderCollapse:"collapse",fontSize:15}}>
+                                <thead><tr>{(Array.isArray(row.rec)?["VILLE","VENTE","COÛT","PROFIT","MARGE","RRR"]:["VILLE","VENTE","RRR"]).map((h,i)=><th key={i} style={{padding:"6px 12px",background:"#0d1117",textAlign:i===0?"left":"right",fontSize:15,letterSpacing:1,color:"#374151",fontWeight:600,borderBottom:"1px solid #1e2533"}}>{h}</th>)}</tr></thead>
                                 <tbody>{CITIES.map(c=>{const{sp,mc,profit:prof,margin:marg}=calcCity(row.id,row.rec,prices,c,focus,tax,fee);return(
                                   <tr key={c} className="cty" onClick={()=>setCity(c)} style={{background:c===city?"#111827":"transparent",transition:"background .1s"}}>
-                                    <td style={{padding:"4px 9px",fontWeight:c===city?600:400,color:c===city?"#c9a227":"#9ca3af"}}>{c===city?"→ ":""}{c}</td>
-                                    <td style={{padding:"4px 9px",textAlign:"right",color:"#d1d5db"}}>{sp?`${fmt(sp)} ☽`:"—"}</td>
-                                    {Array.isArray(row.rec)&&<><td style={{padding:"4px 9px",textAlign:"right",color:"#9ca3af"}}>{mc?`${fmt(mc)} ☽`:"—"}</td>
-                                    <td style={{padding:"4px 9px",textAlign:"right",fontWeight:600,color:pc(prof)}}>{prof!=null?`${prof>=0?"+":""}${fmt(prof)} ☽`:"—"}</td>
-                                    <td style={{padding:"4px 9px",textAlign:"right",fontWeight:600,color:pc(marg)}}>{fmtPct(marg)}</td></>}
-                                    <td style={{padding:"4px 9px",textAlign:"right",color:"#6b7280"}}>{RRR[c]?.[focus?1:0]}%</td>
+                                    <td style={{padding:"6px 12px",fontWeight:c===city?600:400,color:c===city?"#c9a227":"#9ca3af"}}>{c===city?"→ ":""}{c}</td>
+                                    <td style={{padding:"6px 12px",textAlign:"right",color:"#d1d5db"}}>{sp?`${fmt(sp)} ☽`:"—"}</td>
+                                    {Array.isArray(row.rec)&&<><td style={{padding:"6px 12px",textAlign:"right",color:"#9ca3af"}}>{mc?`${fmt(mc)} ☽`:"—"}</td>
+                                    <td style={{padding:"6px 12px",textAlign:"right",fontWeight:600,color:pc(prof)}}>{prof!=null?`${prof>=0?"+":""}${fmt(prof)} ☽`:"—"}</td>
+                                    <td style={{padding:"6px 12px",textAlign:"right",fontWeight:600,color:pc(marg)}}>{fmtPct(marg)}</td></>}
+                                    <td style={{padding:"6px 12px",textAlign:"right",color:"#6b7280"}}>{RRR[c]?.[focus?1:0]}%</td>
                                   </tr>
                                 );})}</tbody>
                               </table>
-                              <div style={{fontSize:8,color:"#374151",marginTop:4}}>Cliquer sur une ville pour la définir comme principale</div>
+                              <div style={{fontSize:14,color:"#374151",marginTop:4}}>Cliquer sur une ville pour la définir comme principale</div>
+                            </div>
+                            <div style={{marginTop:14}}>
+                              <div style={{fontSize:15,color:"#374151",letterSpacing:2,marginBottom:7}}>HISTORIQUE PRIX · {city.toUpperCase()} · {QUALITIES[quality].toUpperCase()}</div>
+                              <Sparkline itemId={row.id}/>
                             </div>
                           </div>
                         </td>
@@ -417,9 +573,9 @@ function App(){
                 ))}
               </tbody>
             </table>
-            {sorted.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:160,color:"#374151",gap:6}}><span style={{fontSize:22}}>{cat?.icon}</span><span style={{fontSize:11}}>Sélectionnez au moins un tier</span></div>}
+            {sorted.length===0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:160,color:"#374151",gap:6}}><span style={{fontSize:22}}>{cat?.icon}</span><span style={{fontSize:15}}>Sélectionnez au moins un tier</span></div>}
           </div>
-          <div style={{padding:"4px 13px",background:"#0b0f17",borderTop:"1px solid #1e2533",display:"flex",gap:12,fontSize:7,color:"#374151",flexShrink:0,flexWrap:"wrap"}}>
+          <div style={{padding:"4px 13px",background:"#0b0f17",borderTop:"1px solid #1e2533",display:"flex",gap:12,fontSize:15,color:"#374151",flexShrink:0,flexWrap:"wrap"}}>
             <span>Recettes : {IS_LOCAL?"proxy.php local":"corsproxy.io"} → gameinfo SBI</span>
             <span>Prix : AODP (6 villes)</span>
             <span style={{marginLeft:"auto"}}>Profit = Prix×(1−taxe−frais) − Σ(mat×qté×(1−RRR))</span>
