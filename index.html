@@ -44,7 +44,7 @@ function getRefineRecipe(itemId){
   const raw=RAW_MAP[base];if(!raw||!REF_RATIO[tier])return null;
   const[rawQty,prevQty]=REF_RATIO[tier];
   const recipe=[];
-  const rawSfx=ench>0&&base!=='STONEBLOCK'?`@${ench}`:'';
+  const rawSfx=ench>0&&base!=='STONEBLOCK'?`_LEVEL${ench}@${ench}`:'';
   recipe.push({id:`T${tier}_${raw}${rawSfx}`,qty:rawQty});
   if(prevQty>0&&tier>2)recipe.push({id:`T${tier-1}_${base}`,qty:prevQty});
   return recipe;
@@ -144,7 +144,7 @@ function App(){
     return src.flatMap(item=>ts.flatMap(tier=>es.flatMap(ench=>{
       const e=item.noEnch?0:ench;
       // Raffinées = _LEVEL{n}, Brutes (et équipements) = @{n}
-      const sfx=isRes&&item.isRefined?(e===0?'':`_LEVEL${e}`):(e===0?'':`@${e}`);
+      const sfx=isRes?(e===0?'':`_LEVEL${e}${item.isRefined?'':'@'+e}`):(e===0?'':`@${e}`);
       const id=`T${tier}_${item.key}${sfx}`;
       if(seen.has(id))return[];seen.add(id);
       return[{...item,id,tier,ench:e}];
@@ -257,7 +257,13 @@ function App(){
     const newP=await fetchBatch(ids,quality);
     // Pass 2 : ingrédients toujours à quality=1 (ressources n'ont que quality=1 sur le marché)
     if(quality!==1){
-      const ingIds=[...new Set(Object.values(recipes).filter(Array.isArray).flatMap(r=>r.map(ri=>toAodp(ri.id))))].filter(id=>ids.includes(id));
+      const resPattern=/^T\d+_(ORE|WOOD|FIBER|HIDE|ROCK|METALBAR|PLANKS|CLOTH|LEATHER|STONEBLOCK)/;
+      const ingIds=[...new Set([
+        // Ingrédients gameinfo (équipements enchantés)
+        ...Object.values(recipes).filter(Array.isArray).flatMap(r=>r.map(ri=>toAodp(ri.id))),
+        // Toutes les ressources brutes/raffinées (toujours quality=1)
+        ...ids.filter(id=>resPattern.test(id))
+      ])].filter(id=>ids.includes(id));
       if(ingIds.length){const ingP=await fetchBatch(ingIds,1);Object.assign(newP,ingP);}
     }
     setPrices(p=>({...p,...newP}));
@@ -268,9 +274,19 @@ function App(){
 
   const allPriceIds=useMemo(()=>{
     const ids=new Set(itemList.map(i=>i.id));
+    // Ingrédients depuis les recettes gameinfo (équipements)
     Object.values(recipes).forEach(r=>{if(Array.isArray(r))r.forEach(ri=>ids.add(toAodp(ri.id)));});
+    // Ingrédients depuis getRefineRecipe (ressources)
+    if(cat?.isResource){
+      itemList.forEach(item=>{
+        if(!item.noRecipe){
+          const rec=getRefineRecipe(item.id);
+          if(rec)rec.forEach(ri=>ids.add(ri.id));
+        }
+      });
+    }
     return[...ids];
-  },[itemList,recipes]);
+  },[itemList,recipes,cat]);
 
   useEffect(()=>{
     if(cat?.isResource)return;
