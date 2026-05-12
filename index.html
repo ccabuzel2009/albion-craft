@@ -98,7 +98,7 @@ function calcCity(itemId,rec,prices,c,focus,tax,fee){
   let mc=null;
   if(Array.isArray(rec)){
     let tot=0;
-    for(const ri of rec){const mp=prices[pkey(ri.id,c)]?.sell||0;if(mp)tot+=mp*ri.qty*(1-rrr);}
+    for(const ri of rec){const mp=prices[pkey(toAodp(ri.id),c)]?.sell||0;if(mp)tot+=mp*ri.qty*(1-rrr);}
     if(tot>0)mc=tot;
   }
   const rev=sp>0?sp*(1-tax/100-fee/100):null;
